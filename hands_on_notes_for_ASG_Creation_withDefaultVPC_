@@ -1,0 +1,260 @@
+Project Structure
+tf-asg-default-vpc/
+├─ modules/
+│  └─ asg/
+│     ├─ main.tf
+│     ├─ vars.tf
+│     └─ outputs.tf
+│
+├─ alb.tf
+├─ data.tf
+├─ main.tf
+├─ keypair.tf
+├─ security.tf
+├─ provider.tf
+├─ variables.tf
+├─ terraform.tfvars
+├─ outputs.tf
+└─ web-server-userdata-script.sh
+________________________________________
+1️⃣ provider.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+________________________________________
+2️⃣ variables.tf
+variable "region" {
+  type = string
+}
+
+variable "instance_type" {
+  type = string
+}
+
+variable "asg_desired_capacity" {
+  type = number
+}
+
+variable "asg_min_size" {
+  type = number
+}
+
+variable "asg_max_size" {
+  type = number
+}
+
+variable "my_ip" {
+  type = string
+}
+________________________________________
+3️⃣ terraform.tfvars
+region               = "us-east-1"
+instance_type        = "t2.micro"
+asg_desired_capacity = 2
+asg_min_size         = 1
+asg_max_size         = 4
+my_ip                = "YOUR_PUBLIC_IP/32"
+________________________________________
+4️⃣ ami.tf (Latest Amazon Linux 2)
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+}
+________________________________________
+5️⃣ Fetch Default VPC & Subnets
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
+  }
+
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+________________________________________
+6️⃣ keypair.tf
+Generate keys first:
+ssh-keygen -t ed25519 -f asgkeygen
+resource "aws_key_pair" "asg_key" {
+  key_name   = "asgkeygen"
+  public_key = file("asgkeygen.pub")
+}
+________________________________________
+7️⃣ security.tf
+ALB Security Group
+resource "aws_security_group" "alb_sg" {
+  vpc_id = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+EC2 Security Group
+resource "aws_security_group" "ec2_sg" {
+  vpc_id = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+________________________________________
+8️⃣ alb.tf
+resource "aws_lb" "alb" {
+  name               = "asg-alb"
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = data.aws_subnets.default.ids
+}
+
+resource "aws_lb_target_group" "tg" {
+  name     = "asg-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+}
+
+resource "aws_lb_listener" "listener" {
+  load_balancer_arn = aws_lb.alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.tg.arn
+  }
+}
+________________________________________
+9️⃣ ASG Module
+modules/asg/vars.tf
+variable "ami_id" {}
+variable "instance_type" {}
+variable "key_name" {}
+variable "security_group_id" {}
+variable "subnet_ids" { type = list(string) }
+variable "target_group_arn" {}
+variable "asg_desired_capacity" {}
+variable "asg_min_size" {}
+variable "asg_max_size" {}
+variable "user_data" {}
+________________________________________
+modules/asg/main.tf
+resource "aws_launch_template" "lt" {
+  image_id               = var.ami_id
+  instance_type          = var.instance_type
+  key_name               = var.key_name
+  vpc_security_group_ids = [var.security_group_id]
+  user_data              = var.user_data
+}
+
+resource "aws_autoscaling_group" "asg" {
+  desired_capacity = var.asg_desired_capacity
+  min_size         = var.asg_min_size
+  max_size         = var.asg_max_size
+
+  vpc_zone_identifier = var.subnet_ids
+  target_group_arns  = [var.target_group_arn]
+
+  launch_template {
+    id      = aws_launch_template.lt.id
+    version = "$Latest"
+  }
+}
+________________________________________
+modules/asg/outputs.tf
+output "asg_name" {
+  value = aws_autoscaling_group.asg.name
+}
+________________________________________
+🔟 autoscaling.tf (Call Module)
+module "asg" {
+  source = "./modules/asg"
+
+  ami_id            = data.aws_ami.amazon_linux.id
+  instance_type     = var.instance_type
+  key_name          = aws_key_pair.asg_key.key_name
+  security_group_id = aws_security_group.ec2_sg.id
+  subnet_ids        = data.aws_subnets.default.ids
+  target_group_arn = aws_lb_target_group.tg.arn
+
+  asg_desired_capacity = var.asg_desired_capacity
+  asg_min_size         = var.asg_min_size
+  asg_max_size         = var.asg_max_size
+
+  user_data = base64encode(file("web-server-userdata-script.sh"))
+}
+________________________________________
+1️⃣1️   web-server-userdata-script.sh
+#!/bin/bash
+yum update -y
+yum install -y httpd wget unzip
+systemctl start httpd
+systemctl enable httpd
+cd /tmp
+wget https://www.tooplate.com/zip-templates/2150_living_parallax.zip
+unzip -o 2150_living_parallax.zip
+cp -r 2150_living_parallax/* /var/www/html/
+chown -R apache:apache /var/www/html/
+________________________________________
+1️⃣2️ outputs.tf
+output "alb_dns_name" {
+  value = aws_lb.alb.dns_name
+}
+________________________________________
+🚀 Run the Project
+terraform init
+terraform fmt
+terraform validate
+terraform plan
+terraform apply -auto-approve
+Open browser:
+http://<ALB_DNS_NAME>
+Destroy:
+terraform destroy -auto-approve
+
